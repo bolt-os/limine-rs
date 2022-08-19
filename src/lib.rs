@@ -122,7 +122,7 @@ impl<T: ?Sized> LiminePtr<T> {
     /// Create a new `LiminePtr` by leaking a [`Box`]
     #[cfg(feature = "alloc")]
     pub fn new_from_box(x: Box<T>) -> LiminePtr<T> {
-        unsafe { Self(NonNull::new_unchecked(Box::leak(x))) }
+        Self(Box::leak(x).into())
     }
 
     /// Creates a new `LiminePtr`
