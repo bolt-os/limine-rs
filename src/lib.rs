@@ -56,19 +56,31 @@
 //! [Limine Boot Protocol]: https://github.com/limine-bootloader/limine/blob/trunk/PROTOCOL.md
 
 #![no_std]
+#![warn(clippy::cargo, clippy::pedantic, clippy::undocumented_unsafe_blocks)]
+#![allow(
+    clippy::cast_lossless,
+    clippy::enum_glob_use,
+    clippy::inline_always,
+    clippy::must_use_candidate,
+    clippy::unreadable_literal
+)]
+#![deny(
+    clippy::semicolon_if_nothing_returned,
+    clippy::debug_assert_with_mut_call
+)]
+
+#![feature(negative_impls)]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+#[cfg(feature = "alloc")]
+use alloc::boxed::Box;
 use core::{
     cell::UnsafeCell,
-    ffi::c_char,
+    ffi::{c_char, c_void},
     ptr::NonNull,
     sync::atomic::{AtomicPtr, Ordering},
-};
-#[cfg(feature = "alloc")]
-use alloc:: {
-    boxed::Box,
 };
 
 unsafe fn strlen(s: *const u8) -> usize {
@@ -99,9 +111,12 @@ impl core::fmt::Debug for RequestId {
 }
 
 impl RequestId {
-    #[inline(always)]
     pub const fn new(uniq: [u64; 2]) -> RequestId {
         Self([0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, uniq[0], uniq[1]])
+    }
+
+    pub const fn for_type<T: LimineRequest>() -> RequestId {
+        T::ID
     }
 }
 
@@ -109,8 +124,9 @@ impl RequestId {
 #[repr(transparent)]
 pub struct LiminePtr<T: ?Sized>(NonNull<T>);
 
-unsafe impl<T: ?Sized + Send> Send for LiminePtr<T> {}
-unsafe impl<T: ?Sized + Sync> Sync for LiminePtr<T> {}
+impl<T: ?Sized> !Send for LiminePtr<T> {}
+impl<T: ?Sized> !Sync for LiminePtr<T> {}
+
 
 impl<T> LiminePtr<T> {
     pub fn new(ptr: *mut T) -> Option<LiminePtr<T>> {
@@ -168,6 +184,11 @@ impl<T: core::fmt::Debug> core::fmt::Debug for LiminePtr<T> {
 }
 
 impl LiminePtr<c_char> {
+    /// Try to convert a C-string into a `&str`
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the pointer does not point a valid UTF-8 string.
     pub fn as_str<'a>(&self) -> Result<&'a str, core::str::Utf8Error> {
         let ptr = self.0.as_ptr().cast::<u8>();
         let data = unsafe { core::slice::from_raw_parts(ptr, strlen(ptr)) };
@@ -240,6 +261,11 @@ impl File {
     pub fn data(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.address as _, self.size) }
     }
+
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.address, self.size) }
+    }
 }
 
 #[repr(C)]
@@ -305,94 +331,132 @@ impl<T> ResponsePtr<T> {
     }
 }
 
-macro_rules! declare_feature {
-    (
-        request:
-            $(#[$request_meta:meta])*
-            struct $request_name:ident: $request_id_0:literal, $request_id_1:literal {
-                $($request_field_name:ident: $request_field_type:ty = ($b:ident) $($e:expr)?),*$(,)?
+mod private {
+    pub trait Sealed {}
+}
+
+pub trait LimineRequest: private::Sealed {
+    const ID: RequestId;
+}
+
+pub(crate) mod feature_macro {
+    #[macro_export]
+    macro_rules! declare_feature {
+        (
+            request:
+                $(#[$request_meta:meta])*
+                struct $request_name:ident: $request_id_0:literal, $request_id_1:literal {
+                    $(
+                        $(#[$request_field_meta:meta])*
+                        $request_field_vis:vis $request_field_name:ident: $request_field_type:ty =
+                            ($b:ident) $($e:expr)?
+                    ),*$(,)?
+                }
+
+            response:
+                $(#[$response_meta:meta])*
+                struct $response_name:ident {
+                    $(
+                        $(#[$response_field_meta:meta])*
+                        $response_field_vis:vis $response_field_name:ident: $response_field_type:ty
+                    ),*$(,)?
+                }
+        ) => {
+
+            #[repr(C)]
+            #[doc = concat!("Request for the [`", stringify!($response_name), "`] feature")]
+            $(#[$request_meta])*
+            pub struct $request_name {
+                id: RequestId,
+                revision: usize,
+                response: ResponsePtr<$response_name>,
+                $(
+                    $(#[$request_field_meta])*
+                    $request_field_vis $request_field_name: $request_field_type
+                ),*
             }
 
-        response:
-            $(#[$response_meta:meta])*
-            struct $response_name:ident {
-                $($response_field_name:ident: $response_field_type:ty),*$(,)?
+            impl $crate::private::Sealed for $request_name {}
+
+            impl LimineRequest for $request_name {
+                const ID: RequestId = RequestId::new([$request_id_0, $request_id_1]);
             }
-    ) => {
 
-        #[repr(C)]
-        $(#[$request_meta])*
-        pub struct $request_name {
-            id: RequestId,
-            revision: usize,
-            response: ResponsePtr<$response_name>,
-            $($request_field_name: $request_field_type),*
-        }
+            impl $request_name {
+                #[doc = concat!("Create a new `", stringify!($request_name), "`")]
+                pub const fn new($($b: $request_field_type),*) -> Self {
+                    Self {
+                        id: Self::ID,
+                        revision: 0,
+                        response: ResponsePtr::null(),
+                        $($request_field_name$(: $e)?),*
+                    }
+                }
 
-        impl $request_name {
-            pub const ID: RequestId = RequestId::new([$request_id_0, $request_id_1]);
+                #[inline(always)]
+                pub const fn id(&self) -> RequestId {
+                    self.id
+                }
 
-            #[doc = concat!("Create a new `", stringify!($request_name), "`")]
-            pub const fn new($($b: $request_field_type),*) -> Self {
-                Self {
-                    id: Self::ID,
-                    revision: 0,
-                    response: ResponsePtr::null(),
-                    $($request_field_name$(: $e)?),*
+                #[inline(always)]
+                pub const fn revision(&self) -> usize {
+                    self.revision
+                }
+
+                #[inline(always)]
+                pub fn response(&self) -> Option<&$response_name> {
+                    self.response.get()
+                }
+
+                /// Set the response pointer
+                ///
+                /// This must only be called by the bootloader if it has properly handled
+                /// the requested feature.
+                ///
+                /// # Safety
+                ///
+                /// The caller must guarantee that no other references to this request exist,
+                /// as if the method took `&mut self`.
+                pub unsafe fn set_response(&self, ptr: LiminePtr<$response_name>) {
+                    self.response.0.get().write(Some(ptr.0));
+                }
+
+                #[inline(always)]
+                pub fn response_mut(&mut self) -> Option<&mut $response_name> {
+                    self.response.get_mut()
+                }
+
+                #[inline(always)]
+                pub fn has_response(&self) -> bool {
+                    self.response().is_some()
                 }
             }
 
-            #[inline(always)]
-            pub const fn id(&self) -> RequestId {
-                self.id
+            #[repr(C)]
+            $(#[$response_meta])*
+            pub struct $response_name {
+                revision: usize,
+                $(
+                    $(#[$response_field_meta])*
+                    $response_field_vis $response_field_name: $response_field_type
+                ),*
             }
 
-            #[inline(always)]
-            pub const fn revision(&self) -> usize {
-                self.revision
-            }
+            impl $response_name {
+                pub const fn new($($response_field_name: $response_field_type),*) -> Self {
+                    Self {
+                        revision: 0,
+                        $($response_field_name),*
+                    }
+                }
 
-            #[inline(always)]
-            pub fn response(&self) -> Option<&$response_name> {
-                self.response.get()
-            }
-
-            pub unsafe fn set_response(&self, ptr: LiminePtr<$response_name>) {
-                self.response.0.get().write(Some(ptr.0));
-            }
-
-            #[inline(always)]
-            pub fn response_mut(&mut self) -> Option<&mut $response_name> {
-                self.response.get_mut()
-            }
-
-            #[inline(always)]
-            pub fn has_response(&self) -> bool {
-                self.response().is_some()
-            }
-        }
-
-        #[repr(C)]
-        $(#[$response_meta])*
-        pub struct $response_name {
-            revision: usize,
-            $($response_field_name: $response_field_type),*
-        }
-
-        impl $response_name {
-            pub const fn new($($response_field_name: $response_field_type),*) -> Self {
-                Self {
-                    revision: 0,
-                    $($response_field_name),*
+                #[inline(always)]
+                pub const fn revision(&self) -> usize {
+                    self.revision
                 }
             }
-
-            #[inline(always)]
-            pub const fn revision(&self) -> usize {
-                self.revision
-            }
-        }
-    };
+        };
+    }
 }
 
 /*
@@ -483,6 +547,14 @@ impl Framebuffers {
  * 5-level Paging
  */
 
+declare_feature! {
+    request:
+        struct FiveLevelPagingRequest : 0x94469551da9b3192, 0xebe5e86db7382888 {}
+
+    response:
+        struct FiveLevelPaging {}
+}
+
 /*
  * SMP (multiprocessor)
  */
@@ -495,7 +567,7 @@ declare_feature! {
 
     response:
         struct Smp {
-            flags: u32,
+            flags: SmpFlags,
             bsp_lapic_id: u32,
             num_cpus: usize,
             cpus: ArrayPtr<SmpInfo>,
@@ -503,7 +575,9 @@ declare_feature! {
 }
 
 unsafe impl Send for SmpRequest {}
+
 unsafe impl Send for Smp {}
+impl !Sync for Smp {}
 
 #[repr(C)]
 #[derive(Debug)]
@@ -540,6 +614,10 @@ impl SmpInfo {
     }
 
     /// Start up the processor described by this entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the CPU has already been started.
     #[inline]
     pub fn start(&self, f: extern "C" fn(&SmpInfo) -> !, arg: usize) -> Result<(), SmpStartupError> {
         if !self.goto_addr.load(Ordering::SeqCst).is_null() {
@@ -556,7 +634,7 @@ impl SmpInfo {
 impl Smp {
     #[inline]
     pub fn flags(&self) -> SmpFlags {
-        unsafe { SmpFlags::from_bits_unchecked(self.flags) }
+        self.flags
     }
 
     #[inline(always)]
@@ -623,13 +701,10 @@ impl MemoryMap {
 
     pub fn steal_pages(&mut self, num_pages: usize) -> Option<usize> {
         self.entries_mut().find_map(|entry| {
-            // Usable regions are guaranteed to have page aligned base and size.
-            if entry.is_usable() && entry.size() >= 4096 * num_pages {
+            (entry.is_usable() && entry.size() >= 4096 * num_pages).then(|| {
                 entry.size -= 4096 * num_pages;
-                Some(entry.base() + entry.size())
-            } else {
-                None
-            }
+                entry.base() + entry.size()
+            })
         })
     }
 }
@@ -745,6 +820,18 @@ impl MemoryKind {
  * Entry Point
  */
 
+pub type EntryPointFn = extern "C" fn() -> !;
+
+declare_feature! {
+    request:
+        struct EntryPointRequest : 0x13d86c035a1cd3e1, 0x2b0caa89d8f3026a {
+            entry: EntryPointFn = (entry),
+        }
+
+    response:
+        struct EntryPoint {}
+}
+
 /*
  * Kernel File
  */
@@ -802,17 +889,64 @@ impl Modules {
  * Root System Description Pointer (RSDP)
  */
 
+declare_feature! {
+    request:
+        struct RsdpRequest : 0xc5e77b6b397e7b43, 0x27637845accdcf3c {}
+
+    response:
+        struct Rsdp {
+            pub rsdp_addr: *mut u8,
+        }
+}
+
 /*
  * System Management BIOS (SMBIOS)
  */
+
+declare_feature! {
+    request:
+        struct SmbiosRequest : 0x9e9046f11e095391, 0xaa4a520fefbde5ee {}
+
+    response:
+        struct Smbios {
+            /// Address of the 32-bit entry point
+            entry32: Option<NonNull<c_void>>,
+            /// Address of the 64-bit entry point
+            entry64: Option<NonNull<c_void>>,
+        }
+}
 
 /*
  * EFI System Table
  */
 
+declare_feature! {
+    request:
+        struct EfiSystemTableRequest : 0x5ceba5163eaaf6d6, 0x0a6981610cf65fcc {}
+
+    response:
+        struct EfiSystemTable {
+            pub addr: *mut u8,
+        }
+}
+
 /*
  * Boot Time
  */
+
+declare_feature! {
+    request:
+        struct BootTimeRequest : 0x502746e184c088aa, 0xfbc5ec83e6327893 {}
+
+    response:
+        /// Reports the system time on boot
+        ///
+        /// The availability of this features depends on the presence of an RTC in the system.
+        struct BootTime {
+            /// Time on boot, as a UNIX timestamp
+            pub boot_time: i64,
+        }
+}
 
 /*
  * Kernel Address
@@ -820,25 +954,40 @@ impl Modules {
 
 declare_feature! {
     request:
-        /// Requests the virtual and physical base addresses of the kernel
         struct KernelAddressRequest : 0x71ba76863cc55f63, 0xb2644a48c516a487 {}
 
     response:
         /// Reports the virtual and physical base addresses of the kernel
         struct KernelAddress {
-            physical_base: usize,
-            virtual_base: usize,
+            pub phys_base: usize,
+            pub virt_base: usize,
         }
 }
 
-impl KernelAddress {
-    /// Returns the virtual base address of the loaded kernel image
-    pub const fn virt_address(&self) -> usize {
-        self.virtual_base
-    }
+/*
+ * Device Tree Blob
+ */
 
-    /// Returns the physical base address of the loaded kernel image
-    pub const fn phys_address(&self) -> usize {
-        self.physical_base
-    }
+declare_feature! {
+    request:
+        struct DtbRequest : 0xb40ddb48fb54bac7, 0x545081493f81ffb7 {}
+
+    response:
+        /// Device Tree Blob
+        ///
+        /// Reports the address of the Device Tree Blob (DTB) passed by firmware.
+        ///
+        /// # Note
+        ///
+        /// The information in the DTB's `/chosen` node may disagree with the information
+        /// provide by other protocol features.
+        struct Dtb {
+            /// *Physical* address of the DTB
+            pub dtb_ptr: *mut u8,
+        }
 }
+
+// SAFETY: `Dtb` just provides the pointer, safety concerns are on whoever uses it.
+unsafe impl Send for DtbRequest {}
+// SAFETY: Ditto.
+unsafe impl Sync for DtbRequest {}
