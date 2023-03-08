@@ -418,7 +418,7 @@ pub(crate) mod feature_macro {
                 /// The caller must guarantee that no other references to this request exist,
                 /// as if the method took `&mut self`.
                 pub unsafe fn set_response(&self, ptr: LiminePtr<$response_name>) {
-                    self.response.0.get().write(Some(ptr.0));
+                    self.response.0.get().write_volatile(Some(ptr.0));
                 }
 
                 #[inline(always)]
