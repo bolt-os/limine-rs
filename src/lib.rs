@@ -56,7 +56,7 @@
 //! [Limine Boot Protocol]: https://github.com/limine-bootloader/limine/blob/trunk/PROTOCOL.md
 
 #![no_std]
-#![warn(clippy::cargo, clippy::pedantic, clippy::undocumented_unsafe_blocks)]
+// #![warn(clippy::cargo, clippy::pedantic, clippy::undocumented_unsafe_blocks)]
 #![allow(
     clippy::cast_lossless,
     clippy::enum_glob_use,
@@ -69,18 +69,12 @@
     clippy::debug_assert_with_mut_call
 )]
 
-#![feature(negative_impls)]
-
-#[cfg(feature = "alloc")]
-extern crate alloc;
-
-#[cfg(feature = "alloc")]
-use alloc::boxed::Box;
 use core::{
     cell::UnsafeCell,
-    ffi::{c_char, c_void},
+    ffi::c_char,
+    fmt,
     ptr::NonNull,
-    sync::atomic::{AtomicPtr, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 unsafe fn strlen(s: *const u8) -> usize {
@@ -115,38 +109,24 @@ impl RequestId {
         Self([0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, uniq[0], uniq[1]])
     }
 
-    pub const fn for_type<T: LimineRequest>() -> RequestId {
+    pub const fn for_type<T: Request>() -> RequestId {
         T::ID
     }
 }
 
 /// A pointer to a resource provided by the bootloader
 #[repr(transparent)]
-pub struct LiminePtr<T: ?Sized>(NonNull<T>);
-
-impl<T: ?Sized> !Send for LiminePtr<T> {}
-impl<T: ?Sized> !Sync for LiminePtr<T> {}
-
+#[derive(Clone, Copy)]
+struct LiminePtr<T>(NonNull<T>);
 
 impl<T> LiminePtr<T> {
-    pub fn new(ptr: *mut T) -> Option<LiminePtr<T>> {
-        Some(Self(NonNull::new(ptr)?))
-    }
-}
-
-impl<T: ?Sized> LiminePtr<T> {
-    /// Create a new `LiminePtr` by leaking a [`Box`]
-    #[cfg(feature = "alloc")]
-    pub fn new_from_box(x: Box<T>) -> LiminePtr<T> {
-        Self(Box::leak(x).into())
-    }
-
     /// Creates a new `LiminePtr`
     ///
     /// # Safety
     ///
     /// `ptr` must not be null
-    pub unsafe fn new_unchecked(ptr: *mut T) -> LiminePtr<T> {
+    #[cfg(feature = "bootloader")]
+    unsafe fn new_unchecked(ptr: *mut T) -> LiminePtr<T> {
         Self(NonNull::new_unchecked(ptr))
     }
 
@@ -155,7 +135,7 @@ impl<T: ?Sized> LiminePtr<T> {
     /// # Safety
     ///
     /// The same requirements as for [`NonNull::as_ref()`] apply.
-    pub unsafe fn as_ref(&self) -> &T {
+    unsafe fn as_ref(&self) -> &T {
         self.0.as_ref()
     }
 
@@ -164,22 +144,8 @@ impl<T: ?Sized> LiminePtr<T> {
     /// # Safety
     ///
     /// The same requirements as for [`NonNull::as_mut()`] apply.
-    pub unsafe fn as_mut(&mut self) -> &mut T {
+    unsafe fn as_mut(&mut self) -> &mut T {
         self.0.as_mut()
-    }
-}
-
-impl<T> core::ops::Deref for LiminePtr<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { self.0.as_ref() }
-    }
-}
-
-impl<T: core::fmt::Debug> core::fmt::Debug for LiminePtr<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        <T as core::fmt::Debug>::fmt(self, f)
     }
 }
 
@@ -189,7 +155,7 @@ impl LiminePtr<c_char> {
     /// # Errors
     ///
     /// Returns `Err` if the pointer does not point a valid UTF-8 string.
-    pub fn as_str<'a>(&self) -> Result<&'a str, core::str::Utf8Error> {
+    fn as_str<'a>(&self) -> Result<&'a str, core::str::Utf8Error> {
         let ptr = self.0.as_ptr().cast::<u8>();
         let data = unsafe { core::slice::from_raw_parts(ptr, strlen(ptr)) };
         core::str::from_utf8(data)
@@ -198,7 +164,7 @@ impl LiminePtr<c_char> {
 
 type ArrayPtr<T> = LiminePtr<LiminePtr<T>>;
 
-impl<'a, T: 'a + ?Sized> ArrayPtr<T> {
+impl<'a, T: 'a> ArrayPtr<T> {
     fn make_iterator(&'a self, len: usize) -> impl Iterator<Item = &'a T> {
         unsafe {
             core::slice::from_raw_parts(self.0.as_ptr(), len)
@@ -217,7 +183,7 @@ impl<'a, T: 'a + ?Sized> ArrayPtr<T> {
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Uuid {
     a: u32,
     b: u16,
@@ -226,35 +192,109 @@ pub struct Uuid {
 }
 
 #[repr(C)]
-#[derive(Debug)]
 pub struct File {
     revision: usize,
     address: *mut u8,
     size: usize,
     path: LiminePtr<c_char>,
-    cmdline: LiminePtr<c_char>,
+    cmdline: Option<LiminePtr<c_char>>,
     media_type: u32,
     unused: u32,
-    tftp_ip: u32,
-    tftp_port: u32,
-    partition_index: u32,
-    mbr_disk_id: u32,
-    gpt_disk_uuid: Uuid,
-    gpt_part_uuid: Uuid,
-    part_uuid: Uuid,
+    pub tftp_ip: u32,
+    pub tftp_port: u32,
+    pub partition_index: u32,
+    pub mbr_disk_id: u32,
+    pub gpt_disk_uuid: Uuid,
+    pub gpt_part_uuid: Uuid,
+    pub part_uuid: Uuid,
 }
 
 unsafe impl Send for File {}
+unsafe impl Sync for File {}
+
+impl fmt::Debug for File {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("File")
+            .field("address", &self.as_ptr())
+            .field("len", &self.len())
+            .field("path", &self.path())
+            .field("cmdline", &self.cmdline())
+            .field("media_type", &self.media_type)
+            .field("tftp_ip", &self.tftp_ip)
+            .field("tftp_port", &self.tftp_port)
+            .field("partition_index", &self.partition_index)
+            .field("mbr_disk_id", &self.mbr_disk_id)
+            .field("gpt_disk_uuid", &self.gpt_disk_uuid)
+            .field("gpt_part_uuid", &self.gpt_part_uuid)
+            .field("part_uuid", &self.part_uuid)
+            .finish()
+    }
+}
 
 impl File {
-    #[inline(always)]
-    pub fn path(&self) -> &str {
-        self.path.as_str().unwrap()
+    /// Create a new `File`
+    ///
+    /// # Safety
+    ///
+    /// `ptr`, `path`, and `cmdline` (if present) must all be valid pointers.
+    #[cfg(feature = "bootloader")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn new(
+        ptr: *mut u8,
+        len: usize,
+        path: *mut c_char,
+        cmdline: Option<*mut c_char>,
+        media_type: u32,
+        tftp_ip: u32,
+        tftp_port: u32,
+        partition_index: u32,
+        mbr_disk_id: u32,
+        gpt_disk_uuid: Uuid,
+        gpt_part_uuid: Uuid,
+        part_uuid: Uuid,
+    ) -> File {
+        Self {
+            revision: 0,
+            address: ptr,
+            size: len,
+            path: LiminePtr::new_unchecked(path),
+            cmdline: cmdline.map(|ptr| unsafe { LiminePtr::new_unchecked(ptr) }),
+            media_type,
+            unused: 0,
+            tftp_ip,
+            tftp_port,
+            partition_index,
+            mbr_disk_id,
+            gpt_disk_uuid,
+            gpt_part_uuid,
+            part_uuid,
+        }
     }
 
     #[inline(always)]
-    pub fn cmdline(&self) -> &str {
-        self.cmdline.as_str().unwrap()
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.address
+    }
+
+    /// Returns the length of the file data, in bytes
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline(always)]
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_str().ok()
+    }
+
+    #[inline(always)]
+    pub fn cmdline(&self) -> Option<&str> {
+        self.cmdline.and_then(|ptr| ptr.as_str().ok())
     }
 
     #[inline]
@@ -270,48 +310,40 @@ impl File {
 
 #[repr(C)]
 pub struct Framebuffer {
-    addr: Option<NonNull<u8>>,
-    width: u64,
-    height: u64,
-    stride: u64,
-    bpp: u16,
-    pixel_format: PixelFormat,
-    edid_size: usize,
-    edid: Option<NonNull<u8>>,
+    pub addr: *mut u8,
+    pub width: u64,
+    pub height: u64,
+    pub stride: u64,
+    pub bpp: u16,
+    pub pixel_format: PixelFormat,
+    pub edid_size: usize,
+    pub edid: Option<NonNull<u8>>,
 }
 
 unsafe impl Send for Framebuffer {}
+unsafe impl Sync for Framebuffer {}
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PixelFormat {
-    memory_model: u8,
-    r_mask_size: u8,
-    r_mask_shift: u8,
-    g_mask_size: u8,
-    g_mask_shift: u8,
-    b_mask_size: u8,
-    b_mask_shift: u8,
-    unused: u8,
-}
-
-impl PixelFormat {
-    #[inline(always)]
-    pub const fn pixel(self, r: u8, g: u8, b: u8) -> u32 {
-        let r = ((r as u32) & ((1 << self.r_mask_size) - 1)) << self.r_mask_shift;
-        let g = ((g as u32) & ((1 << self.g_mask_size) - 1)) << self.g_mask_shift;
-        let b = ((b as u32) & ((1 << self.b_mask_size) - 1)) << self.b_mask_shift;
-
-        r | g | b
-    }
+    pub memory_model: u8,
+    pub r_mask_size: u8,
+    pub r_mask_shift: u8,
+    pub g_mask_size: u8,
+    pub g_mask_shift: u8,
+    pub b_mask_size: u8,
+    pub b_mask_shift: u8,
+    pub unused: [u8; 7],
 }
 
 /// Limine Response Pointer
 ///
-/// An owning pointer to a response from the bootloader.
+/// A unique pointer to bootloader-provided data.
 #[repr(transparent)]
 struct ResponsePtr<T: ?Sized>(UnsafeCell<Option<NonNull<T>>>);
 
 unsafe impl<T: ?Sized + Send> Send for ResponsePtr<T> {}
+// SAFETY: Ditto.
 unsafe impl<T: ?Sized + Sync> Sync for ResponsePtr<T> {}
 
 impl<T> ResponsePtr<T> {
@@ -322,11 +354,17 @@ impl<T> ResponsePtr<T> {
 
     #[inline(always)]
     pub fn get(&self) -> Option<&T> {
+        // SAFETY: This assumes the data is valid if the pointer is non-null.
+        // We have a `&self` so we can guarantee that there are no mutable
+        // references to the data.
         unsafe { self.0.get().read_volatile().map(|ptr| ptr.as_ref()) }
     }
 
     #[inline(always)]
     pub fn get_mut(&mut self) -> Option<&mut T> {
+        // SAFETY: This assumes the data is valid if the pointer is non-null.
+        // We have an `&mut self` so we can guarantee that there are no other
+        // references to the data.
         unsafe { self.0.get().read_volatile().map(|mut ptr| ptr.as_mut()) }
     }
 }
@@ -335,128 +373,142 @@ mod private {
     pub trait Sealed {}
 }
 
-pub trait LimineRequest: private::Sealed {
+pub trait Request: private::Sealed {
     const ID: RequestId;
+    type Feature: Feature;
 }
 
-pub(crate) mod feature_macro {
-    #[macro_export]
-    macro_rules! declare_feature {
-        (
-            request:
-                $(#[$request_meta:meta])*
-                struct $request_name:ident: $request_id_0:literal, $request_id_1:literal {
-                    $(
-                        $(#[$request_field_meta:meta])*
-                        $request_field_vis:vis $request_field_name:ident: $request_field_type:ty =
-                            ($b:ident) $($e:expr)?
-                    ),*$(,)?
-                }
+pub trait Feature: private::Sealed {
+    type Request: Request;
+}
 
-            response:
-                $(#[$response_meta:meta])*
-                struct $response_name:ident {
-                    $(
-                        $(#[$response_field_meta:meta])*
-                        $response_field_vis:vis $response_field_name:ident: $response_field_type:ty
-                    ),*$(,)?
-                }
-        ) => {
+macro_rules! declare_feature {
+    (@field_or_default $e:expr) => { $e };
+    (@field_or_default) => { Default::default() };
 
-            #[repr(C)]
-            #[doc = concat!("Request for the [`", stringify!($response_name), "`] feature")]
-            $(#[$request_meta])*
-            pub struct $request_name {
-                id: RequestId,
-                revision: usize,
-                response: ResponsePtr<$response_name>,
+    (
+        request:
+            $(#[$request_meta:meta])*
+            struct $request_name:ident: $request_id_0:literal, $request_id_1:literal {
                 $(
-                    $(#[$request_field_meta])*
-                    $request_field_vis $request_field_name: $request_field_type
+                    $(#[$request_field_meta:meta])*
+                    $request_field_vis:vis $request_field_name:ident: $request_field_type:ty =
+                        |$b:ident| $($e:expr)?
                 ),*
+                $(,)?
             }
 
-            impl $crate::private::Sealed for $request_name {}
-
-            impl LimineRequest for $request_name {
-                const ID: RequestId = RequestId::new([$request_id_0, $request_id_1]);
-            }
-
-            impl $request_name {
-                #[doc = concat!("Create a new `", stringify!($request_name), "`")]
-                pub const fn new($($b: $request_field_type),*) -> Self {
-                    Self {
-                        id: Self::ID,
-                        revision: 0,
-                        response: ResponsePtr::null(),
-                        $($request_field_name$(: $e)?),*
-                    }
-                }
-
-                #[inline(always)]
-                pub const fn id(&self) -> RequestId {
-                    self.id
-                }
-
-                #[inline(always)]
-                pub const fn revision(&self) -> usize {
-                    self.revision
-                }
-
-                #[inline(always)]
-                pub fn response(&self) -> Option<&$response_name> {
-                    self.response.get()
-                }
-
-                /// Set the response pointer
-                ///
-                /// This must only be called by the bootloader if it has properly handled
-                /// the requested feature.
-                ///
-                /// # Safety
-                ///
-                /// The caller must guarantee that no other references to this request exist,
-                /// as if the method took `&mut self`.
-                pub unsafe fn set_response(&self, ptr: LiminePtr<$response_name>) {
-                    self.response.0.get().write_volatile(Some(ptr.0));
-                }
-
-                #[inline(always)]
-                pub fn response_mut(&mut self) -> Option<&mut $response_name> {
-                    self.response.get_mut()
-                }
-
-                #[inline(always)]
-                pub fn has_response(&self) -> bool {
-                    self.response().is_some()
-                }
-            }
-
-            #[repr(C)]
-            $(#[$response_meta])*
-            pub struct $response_name {
-                revision: usize,
+        response:
+            $(#[$response_meta:meta])*
+            struct $response_name:ident {
                 $(
-                    $(#[$response_field_meta])*
-                    $response_field_vis $response_field_name: $response_field_type
-                ),*
+                    $(#[$response_field_meta:meta])*
+                    $response_field_vis:vis $response_field_name:ident: $response_field_type:ty
+                ),*$(,)?
+            }
+    ) => {
+
+        #[repr(C)]
+        #[doc = concat!("Request for the [`", stringify!($response_name), "`] feature")]
+        $(#[$request_meta])*
+        pub struct $request_name {
+            id: $crate::RequestId,
+            revision: usize,
+            response: $crate::ResponsePtr<$response_name>,
+            $(
+                $(#[$request_field_meta])*
+                $request_field_vis $request_field_name: $request_field_type
+            ),*
+        }
+
+        impl $crate::private::Sealed for $request_name {}
+
+        impl $crate::Request for $request_name {
+            const ID: $crate::RequestId = $crate::RequestId::new([$request_id_0, $request_id_1]);
+            type Feature = $response_name;
+        }
+
+        impl $request_name {
+            #[doc = concat!("Create a new `", stringify!($request_name), "`")]
+            pub const fn new($($b: $request_field_type),*) -> Self {
+                Self {
+                    id: Self::ID,
+                    revision: 0,
+                    response: $crate::ResponsePtr::null(),
+                    $($request_field_name$(: $e)?),*
+                }
             }
 
-            impl $response_name {
-                pub const fn new($($response_field_name: $response_field_type),*) -> Self {
-                    Self {
-                        revision: 0,
-                        $($response_field_name),*
-                    }
-                }
-
-                #[inline(always)]
-                pub const fn revision(&self) -> usize {
-                    self.revision
-                }
+            /// Returns the [`RequestId`] of this request
+            #[inline(always)]
+            pub const fn id(&self) -> $crate::RequestId {
+                self.id
             }
-        };
-    }
+
+            #[inline(always)]
+            pub const fn revision(&self) -> usize {
+                self.revision
+            }
+
+            #[inline(always)]
+            pub fn response(&self) -> Option<&$response_name> {
+                self.response.get()
+            }
+
+            /// Set the response pointer
+            ///
+            /// This must only be called by the bootloader if it has properly handled
+            /// the requested feature.
+            ///
+            /// # Safety
+            ///
+            /// The caller must guarantee that no other references to this request exist,
+            /// as if the method took `&mut self`.
+            pub unsafe fn set_response(&self, ptr: *mut $response_name) {
+                self.response.0.get().write_volatile(Some(NonNull::new(ptr).unwrap()));
+            }
+
+            #[inline(always)]
+            pub fn response_mut(&mut self) -> Option<&mut $response_name> {
+                self.response.get_mut()
+            }
+
+            #[inline(always)]
+            pub fn has_response(&self) -> bool {
+                self.response().is_some()
+            }
+        }
+
+        #[repr(C)]
+        $(#[$response_meta])*
+        pub struct $response_name {
+            pub revision: usize,
+            $(
+                $(#[$response_field_meta])*
+                $response_field_vis $response_field_name: $response_field_type
+            ),*
+        }
+
+        impl private::Sealed for $response_name {}
+
+        impl Feature for $response_name {
+            type Request = $request_name;
+        }
+
+        impl $response_name {
+            // pub const fn new($($response_field_name: $response_field_type),*) -> Self {
+            //     Self {
+            //         revision: 0,
+            //         $($response_field_name),*
+            //     }
+            // }
+
+            #[inline(always)]
+            pub const fn revision(&self) -> usize {
+                self.revision
+            }
+        }
+    };
 }
 
 /*
@@ -474,11 +526,41 @@ declare_feature! {
         }
 }
 
+unsafe impl Send for BootloaderInfo {}
+unsafe impl Sync for BootloaderInfo {}
+
 impl BootloaderInfo {
+    /// Create a new `BootloaderInfo` structure.
+    ///
+    /// # Safety
+    ///
+    /// Both `name` and `version` must be valid ASCII byte strings terminated with
+    /// a NUL byte.
+    #[cfg(feature = "bootloader")]
+    pub unsafe fn new(name: *mut c_char, version: *mut c_char) -> BootloaderInfo {
+        debug_assert!(!name.is_null());
+        debug_assert!(!version.is_null());
+        Self {
+            revision: 0,
+            name: LiminePtr::new_unchecked(name),
+            version: LiminePtr::new_unchecked(version),
+        }
+    }
+
+    /// Returns the bootloader's brand string
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if the bootloader provided string is not valid UTF-8.
     pub fn brand(&self) -> &str {
         self.name.as_str().unwrap()
     }
 
+    /// Returns the bootloader's version string
+    ///
+    /// # Panics
+    ///
+    /// This function will panic for the same reasons as [`brand()`].
     pub fn version(&self) -> &str {
         self.version.as_str().unwrap()
     }
@@ -491,11 +573,18 @@ impl BootloaderInfo {
 declare_feature! {
     request:
         struct StackSizeRequest : 0x224ef0460a8e8926, 0xe1cb0fc25f46ea3d {
-            stack_size: usize = (stack_size),
+            pub stack_size: usize = |stack_size|,
         }
 
     response:
         struct StackSize {}
+}
+
+impl StackSize {
+    #[cfg(feature = "bootloader")]
+    pub const fn new() -> StackSize {
+        Self { revision: 0 }
+    }
 }
 
 /*
@@ -508,19 +597,16 @@ declare_feature! {
 
     response:
         struct Hhdm {
-            base: usize,
+            pub base: usize,
         }
 }
 
 impl Hhdm {
-    pub const fn base(&self) -> usize {
-        self.base
+    #[cfg(feature = "bootloader")]
+    pub const fn new(base: usize) -> Hhdm {
+        Self { revision: 0, base }
     }
 }
-
-/*
- * Terminal
- */
 
 /*
  * Framebuffer
@@ -536,6 +622,9 @@ declare_feature! {
             framebuffers: ArrayPtr<Framebuffer>,
         }
 }
+
+unsafe impl Send for FramebufferRequest {}
+unsafe impl Sync for FramebufferRequest {}
 
 impl Framebuffers {
     pub fn framebuffers(&self) -> impl Iterator<Item = &Framebuffer> {
@@ -555,96 +644,82 @@ declare_feature! {
         struct FiveLevelPaging {}
 }
 
+impl FiveLevelPaging {
+    #[cfg(feature = "bootloader")]
+    pub const fn new() -> FiveLevelPaging {
+        Self { revision: 0 }
+    }
+}
+
 /*
  * SMP (multiprocessor)
  */
 
+bitflags::bitflags! {
+    #[repr(transparent)]
+    pub struct SmpRequestFlags : u64 {
+        #[cfg(target_arch = "x86_64")]
+        const X2APIC = 0x1;
+    }
+
+    #[repr(transparent)]
+    pub struct SmpFlags : u32 {
+        #[cfg(target_arch = "x86_64")]
+        const X2APIC = 0x1;
+    }
+}
+
 declare_feature! {
     request:
         struct SmpRequest : 0x95a67b819a1b857e, 0xa0b61b723b6a73e0 {
-            flags: SmpRequestFlags = (flags),
+            flags: SmpRequestFlags = |flags|,
         }
 
     response:
         struct Smp {
-            flags: SmpFlags,
-            bsp_lapic_id: u32,
+            pub flags: SmpFlags,
+            #[cfg(target_arch = "x86_64")]
+            pub bsp_lapic_id: u32,
+            #[cfg(target_arch = "aarch64")]
+            pub bsp_mpidr: usize,
+            #[cfg(target_arch = "riscv64")]
+            pub bsp_hartid: usize,
             num_cpus: usize,
             cpus: ArrayPtr<SmpInfo>,
         }
 }
 
-unsafe impl Send for SmpRequest {}
-
 unsafe impl Send for Smp {}
-impl !Sync for Smp {}
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct SmpInfo {
-    processor_id: u32,
-    lapic_id: u32,
-    reserved: u64,
-    /// AP startup address
-    ///
-    /// An atomic write to this field will break the corresponding AP from its
-    /// wait-loop, causing it to jump to the address written.
-    goto_addr: AtomicPtr<extern "C" fn() -> !>,
-    argument: UnsafeCell<usize>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SmpStartupError;
-
-impl SmpInfo {
-    pub fn new(processor_id: u32, lapic_id: u32, reserved: u64) -> SmpInfo {
-        Self {
-            processor_id,
-            lapic_id,
-            reserved,
-            goto_addr: AtomicPtr::new(core::ptr::null_mut()),
-            argument: UnsafeCell::new(0),
-        }
-    }
-
-    /// Returns the LAPIC ID for this processor
-    #[inline(always)]
-    pub const fn lapic_id(&self) -> u32 {
-        self.lapic_id
-    }
-
-    /// Start up the processor described by this entry.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if the CPU has already been started.
-    #[inline]
-    pub fn start(&self, f: extern "C" fn(&SmpInfo) -> !, arg: usize) -> Result<(), SmpStartupError> {
-        if !self.goto_addr.load(Ordering::SeqCst).is_null() {
-            return Err(SmpStartupError);
-        }
-
-        unsafe { self.argument.get().write_volatile(arg) };
-        self.goto_addr.store(f as _, Ordering::SeqCst);
-
-        Ok(())
-    }
-}
+unsafe impl Sync for Smp {}
 
 impl Smp {
-    #[inline]
-    pub fn flags(&self) -> SmpFlags {
-        self.flags
-    }
-
-    #[inline(always)]
-    pub const fn bsp_lapic_id(&self) -> u32 {
-        self.bsp_lapic_id
-    }
-
-    #[inline(always)]
-    pub const fn num_cpus(&self) -> usize {
-        self.num_cpus
+    /// Create a new `Smp` response
+    ///
+    /// # Safety
+    ///
+    /// `cpus` must be a valid pointer to an array of pointers, which themselves are valid
+    /// pointers to an [`SmpInfo`].
+    #[cfg(feature = "bootloader")]
+    pub unsafe fn new(
+        flags: SmpFlags,
+        #[cfg(target_arch = "x86_64")] bsp_lapic_id: u32,
+        #[cfg(target_arch = "aarch64")] bsp_mpidr: usize,
+        #[cfg(target_arch = "riscv64")] bsp_hartid: usize,
+        cpus: *mut *mut SmpInfo,
+        len: usize,
+    ) -> Smp {
+        Self {
+            revision: 0,
+            flags,
+            #[cfg(target_arch = "x86_64")]
+            bsp_lapic_id,
+            #[cfg(target_arch = "aarch64")]
+            bsp_mpidr,
+            #[cfg(target_arch = "riscv64")]
+            bsp_hartid,
+            num_cpus: len,
+            cpus: ArrayPtr::new_unchecked(cpus.cast()),
+        }
     }
 
     #[inline]
@@ -653,17 +728,74 @@ impl Smp {
     }
 }
 
-bitflags::bitflags! {
-    #[repr(transparent)]
-    pub struct SmpRequestFlags : u64 {
-        const X2APIC = 0x1;
-    }
+#[repr(C)]
+#[derive(Default)]
+pub struct SmpInfo {
+    /// ACPI Processor UID
+    pub processor_id: u32,
+
+    #[cfg(target_arch = "x86_64")]
+    /// Local APIC ID
+    pub lapic_id: u32,
+
+    #[cfg(target_arch = "aarch64")]
+    /// GIC CPU Interface Number
+    pub gic_iface_no: usize,
+    #[cfg(target_arch = "aarch64")]
+    /// Processor MPIDR
+    pub mpidr: usize,
+
+    #[cfg(target_arch = "riscv64")]
+    /// Hart ID
+    pub hartid: usize,
+
+    _reserved: u64,
+    goto_addr: AtomicUsize,
+    argument: UnsafeCell<usize>,
 }
 
-bitflags::bitflags! {
-    #[repr(transparent)]
-    pub struct SmpFlags : u32 {
-        const X2APIC = 0x1;
+pub type SmpEntryPoint = unsafe extern "C" fn(&SmpInfo) -> !;
+
+impl SmpInfo {
+    #[cfg(feature = "bootloader")]
+    pub const fn new(
+        processor_id: u32,
+        #[cfg(target_arch = "x86_64")] lapic_id: u32,
+        #[cfg(target_arch = "aarch64")] gic_iface_no: usize,
+        #[cfg(target_arch = "aarch64")] mpidr: usize,
+        #[cfg(target_arch = "riscv64")] hartid: usize,
+    ) -> SmpInfo {
+        Self {
+            processor_id,
+            #[cfg(target_arch = "x86_64")]
+            lapic_id,
+            #[cfg(target_arch = "aarch64")]
+            gic_iface_no,
+            #[cfg(target_arch = "aarch64")]
+            mpidr,
+            #[cfg(target_arch = "riscv64")]
+            hartid,
+            _reserved: 0,
+            goto_addr: AtomicUsize::new(0),
+            argument: UnsafeCell::new(0),
+        }
+    }
+
+    /// Start the CPU.
+    ///
+    /// The CPU will begin executing at `entry` with the same machine state at the BSP.
+    ///
+    /// # Safety
+    ///
+    /// This function must only be called once. Any subsequent calls to this function will
+    /// overwrite the previously stored `arg`, potentially corrupting the AP's state.
+    pub unsafe fn start(&self, entry: SmpEntryPoint, arg: usize) {
+        self.argument.get().write_volatile(arg);
+        self.goto_addr.store(entry as usize, Ordering::SeqCst);
+    }
+
+    pub fn argument(&self) -> usize {
+        unsafe { self.argument.get().read() }
     }
 }
 
@@ -682,7 +814,25 @@ declare_feature! {
         }
 }
 
+unsafe impl Send for MemoryMap {}
+unsafe impl Sync for MemoryMap {}
+
 impl MemoryMap {
+    /// Create a new `MemoryMap` response
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a valid pointer to an array of pointers, which themselves are valid
+    /// pointers to a [`MemoryMapEntry`].
+    #[cfg(feature = "bootloader")]
+    pub unsafe fn new(ptr: *mut *mut MemoryMapEntry, len: usize) -> MemoryMap {
+        Self {
+            revision: 0,
+            len,
+            ptr: LiminePtr::new_unchecked(ptr.cast()),
+        }
+    }
+
     pub const fn len(&self) -> usize {
         self.len
     }
@@ -699,11 +849,23 @@ impl MemoryMap {
         self.ptr.make_iterator_mut(self.len)
     }
 
+    pub fn usable_entries(&self) -> impl Iterator<Item = &MemoryMapEntry> {
+        self.ptr
+            .make_iterator(self.len)
+            .filter(|entry| entry.kind() == MemoryKind::Usable)
+    }
+
+    pub fn usable_entries_mut(&mut self) -> impl Iterator<Item = &mut MemoryMapEntry> {
+        self.ptr
+            .make_iterator_mut(self.len)
+            .filter(|entry| entry.kind() == MemoryKind::Usable)
+    }
+
     pub fn steal_pages(&mut self, num_pages: usize) -> Option<usize> {
         self.entries_mut().find_map(|entry| {
-            (entry.is_usable() && entry.size() >= 4096 * num_pages).then(|| {
+            (entry.is_usable() && entry.size >= 4096 * num_pages).then(|| {
                 entry.size -= 4096 * num_pages;
-                entry.base() + entry.size()
+                entry.base + entry.size
             })
         })
     }
@@ -714,7 +876,7 @@ impl MemoryMap {
 pub struct MemoryMapEntry {
     pub base: usize,
     pub size: usize,
-    pub kind: usize,
+    kind: usize,
 }
 
 impl core::fmt::Debug for MemoryMapEntry {
@@ -734,14 +896,6 @@ impl MemoryMapEntry {
             size,
             kind: kind.to_usize(),
         }
-    }
-
-    pub fn base(&self) -> usize {
-        self.base
-    }
-
-    pub fn size(&self) -> usize {
-        self.size
     }
 
     pub fn kind(&self) -> MemoryKind {
@@ -820,16 +974,23 @@ impl MemoryKind {
  * Entry Point
  */
 
-pub type EntryPointFn = extern "C" fn() -> !;
+pub type EntryPointFn = unsafe extern "C" fn() -> !;
 
 declare_feature! {
     request:
         struct EntryPointRequest : 0x13d86c035a1cd3e1, 0x2b0caa89d8f3026a {
-            entry: EntryPointFn = (entry),
+            pub entry: EntryPointFn = |entry|,
         }
 
     response:
         struct EntryPoint {}
+}
+
+impl EntryPoint {
+    #[cfg(feature = "bootloader")]
+    pub const fn new() -> EntryPoint {
+        Self { revision: 0 }
+    }
 }
 
 /*
@@ -842,21 +1003,36 @@ declare_feature! {
 
     response:
         struct KernelFile {
-            file: LiminePtr<File>,
+            file: *mut File,
         }
 }
 
+unsafe impl Send for KernelFile {}
+unsafe impl Sync for KernelFile {}
+
+impl KernelFile {
+    /// Create a new `KernelFile` response
+    ///
+    /// # Safety
+    ///
+    /// `file` must be a valid pointer to a [`File`].
+    #[cfg(feature = "bootloader")]
+    pub unsafe fn new(file: *mut File) -> KernelFile {
+        Self { revision: 0, file }
+    }
+}
+
 impl core::ops::Deref for KernelFile {
-    type Target = LiminePtr<File>;
+    type Target = File;
 
     fn deref(&self) -> &Self::Target {
-        &self.file
+        unsafe { &*self.file }
     }
 }
 
 impl core::ops::DerefMut for KernelFile {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.file
+        unsafe { &mut *self.file }
     }
 }
 
@@ -875,13 +1051,47 @@ declare_feature! {
         }
 }
 
+unsafe impl Send for Modules {}
+unsafe impl Sync for Modules {}
+
 impl Modules {
+    /// Create a new `Modules` response
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a valid pointer to an array of pointers, which themselves are valid
+    /// pointers to a [`File`].
+    #[cfg(feature = "bootloader")]
+    pub unsafe fn new(ptr: *mut *mut File, len: usize) -> Modules {
+        Self {
+            revision: 0,
+            len,
+            data: ArrayPtr::new_unchecked(ptr.cast()),
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn modules(&self) -> impl Iterator<Item = &File> {
         self.data.make_iterator(self.len)
     }
 
+    pub fn modules_mut(&mut self) -> impl Iterator<Item = &mut File> {
+        self.data.make_iterator_mut(self.len)
+    }
+
     pub fn find_module(&self, path: &str) -> Option<&File> {
-        self.modules().find(|file| file.path() == path)
+        self.modules().find(|file| file.path() == Some(path))
+    }
+
+    pub fn find_module_mut(&mut self, path: &str) -> Option<&mut File> {
+        self.modules_mut().find(|file| file.path() == Some(path))
     }
 }
 
@@ -899,6 +1109,11 @@ declare_feature! {
         }
 }
 
+// SAFETY: `Rsdp` does not access the contained pointer.
+unsafe impl Send for Rsdp {}
+// SAFETY: `Rsdp` does not access the contained pointer.
+unsafe impl Sync for Rsdp {}
+
 /*
  * System Management BIOS (SMBIOS)
  */
@@ -910,11 +1125,16 @@ declare_feature! {
     response:
         struct Smbios {
             /// Address of the 32-bit entry point
-            entry32: Option<NonNull<c_void>>,
+            entry32: *mut u8,
             /// Address of the 64-bit entry point
-            entry64: Option<NonNull<c_void>>,
+            entry64: *mut u8,
         }
 }
+
+// SAFETY: `Smbios` does not access the contained pointer.
+unsafe impl Send for Smbios {}
+// SAFETY: `Smbios` does not access the contained pointer.
+unsafe impl Sync for Smbios {}
 
 /*
  * EFI System Table
@@ -929,6 +1149,11 @@ declare_feature! {
             pub addr: *mut u8,
         }
 }
+
+// SAFETY: `EfiSystemTable` does not access the contained pointer.
+unsafe impl Send for EfiSystemTable {}
+// SAFETY: `EfiSystemTable` does not access the contained pointer.
+unsafe impl Sync for EfiSystemTable {}
 
 /*
  * Boot Time
@@ -948,6 +1173,16 @@ declare_feature! {
         }
 }
 
+impl BootTime {
+    #[cfg(feature = "bootloader")]
+    pub const fn new(boot_time: i64) -> BootTime {
+        Self {
+            revision: 0,
+            boot_time,
+        }
+    }
+}
+
 /*
  * Kernel Address
  */
@@ -959,9 +1194,20 @@ declare_feature! {
     response:
         /// Reports the virtual and physical base addresses of the kernel
         struct KernelAddress {
-            pub phys_base: usize,
-            pub virt_base: usize,
+            pub phys: usize,
+            pub virt: usize,
         }
+}
+
+impl KernelAddress {
+    #[cfg(feature = "bootloader")]
+    pub const fn new(phys: usize, virt: usize) -> KernelAddress {
+        Self {
+            revision: 0,
+            phys,
+            virt,
+        }
+    }
 }
 
 /*
@@ -987,7 +1233,90 @@ declare_feature! {
         }
 }
 
-// SAFETY: `Dtb` just provides the pointer, safety concerns are on whoever uses it.
-unsafe impl Send for DtbRequest {}
-// SAFETY: Ditto.
-unsafe impl Sync for DtbRequest {}
+// SAFETY: `Dtb` does not access the contained pointer.
+unsafe impl Send for Dtb {}
+// SAFETY: `Dtb` does not access the contained pointer.
+unsafe impl Sync for Dtb {}
+
+impl Dtb {
+    #[cfg(feature = "bootloader")]
+    pub const fn new(ptr: *mut u8) -> Dtb {
+        Self {
+            revision: 0,
+            dtb_ptr: ptr,
+        }
+    }
+}
+
+/*
+ * Paging Mode
+ */
+
+#[cfg(target_arch = "x86_64")]
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PagingMode {
+    FourLevel = 0,
+    FiveLevel,
+}
+
+#[cfg(target_arch = "riscv64")]
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PagingMode {
+    Sv39 = 8,
+    Sv48,
+    Sv57,
+}
+
+declare_feature! {
+    request:
+        struct PagingModeRequest : 0x95c1a0edab0944cb, 0xa4e5cb3842f7488a {
+            pub mode: PagingMode = |mode|,
+            pub flags: PagingModeRequestFlags = |flags|,
+        }
+
+    response:
+        struct PagingModeResponse {
+            mode: usize,
+            pub flags: PagingModeResponseFlags,
+        }
+}
+
+impl PagingModeResponse {
+    #[cfg(feature = "bootloader")]
+    pub const fn new(mode: PagingMode, flags: PagingModeResponseFlags) -> PagingModeResponse {
+        Self {
+            revision: 0,
+            mode: mode as usize,
+            flags,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub const fn mode(&self) -> PagingMode {
+        match self.mode {
+            0 => PagingMode::FourLevel,
+            1 => PagingMode::FiveLevel,
+            _ => panic!("invalid paging mode"),
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub const fn mode(&self) -> PagingMode {
+        match self.mode {
+            8 => PagingMode::Sv39,
+            9 => PagingMode::Sv48,
+            10 => PagingMode::Sv57,
+            _ => panic!("invalid paging mode"),
+        }
+    }
+}
+
+bitflags::bitflags! {
+    #[repr(transparent)]
+    pub struct PagingModeRequestFlags : usize {}
+
+    #[repr(transparent)]
+    pub struct PagingModeResponseFlags : usize {}
+}
