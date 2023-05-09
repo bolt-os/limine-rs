@@ -183,15 +183,16 @@ impl<'a, T: 'a> ArrayPtr<T> {
 }
 
 #[repr(C)]
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct Uuid {
-    a: u32,
-    b: u16,
-    c: u16,
-    d: [u8; 8],
+    pub a: u32,
+    pub b: u16,
+    pub c: u16,
+    pub d: [u8; 8],
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub struct File {
     revision: usize,
     address: *mut u8,
@@ -309,6 +310,7 @@ impl File {
 }
 
 #[repr(C)]
+#[derive(Clone, Debug)]
 pub struct Framebuffer {
     pub addr: *mut u8,
     pub width: u64,
@@ -1114,6 +1116,13 @@ unsafe impl Send for Rsdp {}
 // SAFETY: `Rsdp` does not access the contained pointer.
 unsafe impl Sync for Rsdp {}
 
+impl Rsdp {
+    #[cfg(feature = "bootloader")]
+    pub const fn new(addr: *mut u8) -> Rsdp {
+        Self { revision: 0, rsdp_addr: addr }
+    }
+}
+
 /*
  * System Management BIOS (SMBIOS)
  */
@@ -1136,6 +1145,17 @@ unsafe impl Send for Smbios {}
 // SAFETY: `Smbios` does not access the contained pointer.
 unsafe impl Sync for Smbios {}
 
+impl Smbios {
+    #[cfg(feature = "bootloader")]
+    pub const fn new(entry32: *mut u8, entry64: *mut u8) -> Smbios {
+        Self {
+            revision: 0,
+            entry32,
+            entry64,
+        }
+    }
+}
+
 /*
  * EFI System Table
  */
@@ -1154,6 +1174,13 @@ declare_feature! {
 unsafe impl Send for EfiSystemTable {}
 // SAFETY: `EfiSystemTable` does not access the contained pointer.
 unsafe impl Sync for EfiSystemTable {}
+
+impl EfiSystemTable {
+    #[cfg(feature = "bootloader")]
+    pub const fn new(addr: *mut u8) -> EfiSystemTable {
+        Self { revision: 0, addr }
+    }
+}
 
 /*
  * Boot Time
