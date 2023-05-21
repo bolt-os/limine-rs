@@ -1279,7 +1279,7 @@ impl Dtb {
  * Paging Mode
  */
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PagingMode {
@@ -1291,7 +1291,7 @@ pub enum PagingMode {
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PagingMode {
-    Sv39 = 8,
+    Sv39 = 0,
     Sv48,
     Sv57,
 }
@@ -1332,9 +1332,9 @@ impl PagingModeResponse {
     #[cfg(target_arch = "riscv64")]
     pub const fn mode(&self) -> PagingMode {
         match self.mode {
-            8 => PagingMode::Sv39,
-            9 => PagingMode::Sv48,
-            10 => PagingMode::Sv57,
+            0 => PagingMode::Sv39,
+            1 => PagingMode::Sv48,
+            2 => PagingMode::Sv57,
             _ => panic!("invalid paging mode"),
         }
     }
