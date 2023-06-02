@@ -191,6 +191,22 @@ pub struct Uuid {
     pub d: [u8; 8],
 }
 
+#[cfg(feature = "uuid")]
+impl From<uuid::Uuid> for Uuid {
+    fn from(value: uuid::Uuid) -> Self {
+        let (a, b, c, d) = value.as_fields();
+        Self { a, b, c, d: *d }
+    }
+}
+
+#[cfg(feature = "uuid")]
+impl From<Uuid> for uuid::Uuid {
+    fn from(value: Uuid) -> Self {
+        let Uuid { a, b, c, d } = value;
+        uuid::Uuid::from_fields(a, b, c, &d)
+    }
+}
+
 #[repr(C)]
 #[derive(Clone)]
 pub struct File {
@@ -1119,7 +1135,10 @@ unsafe impl Sync for Rsdp {}
 impl Rsdp {
     #[cfg(feature = "bootloader")]
     pub const fn new(addr: *mut u8) -> Rsdp {
-        Self { revision: 0, rsdp_addr: addr }
+        Self {
+            revision: 0,
+            rsdp_addr: addr,
+        }
     }
 }
 

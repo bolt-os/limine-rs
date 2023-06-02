@@ -10,6 +10,8 @@ repository = "https://github.com/bolt-os/limine-rs"
 [features]
 default = []
 bootloader = []
+uuid = ["dep:uuid"]
 
 [dependencies]
 bitflags = "<2"
+uuid = { version = "1.3", default-features = false, optional = true }
